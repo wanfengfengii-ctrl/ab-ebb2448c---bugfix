@@ -6,6 +6,7 @@ only. Paths are supplied leaf -> root; policy processing runs root -> leaf.
 """
 from __future__ import annotations
 
+import dataclasses
 from urllib.parse import urlparse
 
 from .certmodel import ParsedCert
@@ -84,6 +85,46 @@ def _leaf_uri_names(leaf: ParsedCert) -> list[str]:
     return list(leaf.san_uri)
 
 
+def leaf_dns_names(leaf: ParsedCert) -> list[str]:
+    return _leaf_dns_names(leaf)
+
+
+def leaf_uri_names(leaf: ParsedCert) -> list[str]:
+    return _leaf_uri_names(leaf)
+
+
+def name_constraint_violation(ca: ParsedCert,
+                              dns_names: list[str],
+                              uri_names: list[str]) -> dict | None:
+    """A single CA's name constraints applied to the fixed leaf names.
+
+    Returns the failure detail (``at`` references ``ca``) or None. Splitting
+    this out lets the path finder evaluate the (CA, leaf) verdict once per
+    certificate instead of re-walking every name on every candidate path.
+    """
+    for name in dns_names:
+        if ca.nc_excluded_dns and any(dns_in_subtree(name, c) for c in ca.nc_excluded_dns):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "kind": "dns_excluded", "name": name}
+        if ca.nc_permitted_dns and not any(
+                dns_in_subtree(name, c) for c in ca.nc_permitted_dns):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "kind": "dns_not_permitted", "name": name}
+    for name in uri_names:
+        if ca.nc_excluded_uri and any(uri_in_subtree(name, c) for c in ca.nc_excluded_uri):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "kind": "uri_excluded", "name": name}
+        if ca.nc_permitted_uri and not any(
+                uri_in_subtree(name, c) for c in ca.nc_permitted_uri):
+            return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                    "kind": "uri_not_permitted", "name": name}
+    if not dns_names and not uri_names and (
+            ca.nc_permitted_dns or ca.nc_permitted_uri):
+        return {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
+                "kind": "no_name_matching_permitted_subtree"}
+    return None
+
+
 def check_name_constraints(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, dict | None]:
     """Every CA's constraints apply to all certificates below it."""
     leaf = path_leaf_to_root[0]
@@ -92,26 +133,9 @@ def check_name_constraints(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, d
     # path[0] leaf, path[1:] issuers; only issuers carry constraints that
     # constrain the leaf. (A self-issued leaf constraints are irrelevant.)
     for ca in path_leaf_to_root[1:]:
-        for name in dns_names:
-            if ca.nc_excluded_dns and any(dns_in_subtree(name, c) for c in ca.nc_excluded_dns):
-                return False, {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                               "kind": "dns_excluded", "name": name}
-            if ca.nc_permitted_dns and not any(
-                    dns_in_subtree(name, c) for c in ca.nc_permitted_dns):
-                return False, {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                               "kind": "dns_not_permitted", "name": name}
-        for name in uri_names:
-            if ca.nc_excluded_uri and any(uri_in_subtree(name, c) for c in ca.nc_excluded_uri):
-                return False, {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                               "kind": "uri_excluded", "name": name}
-            if ca.nc_permitted_uri and not any(
-                    uri_in_subtree(name, c) for c in ca.nc_permitted_uri):
-                return False, {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                               "kind": "uri_not_permitted", "name": name}
-        if not dns_names and not uri_names and (
-                ca.nc_permitted_dns or ca.nc_permitted_uri):
-            return False, {"rule": "NAME_CONSTRAINTS", "at": ca.fingerprint,
-                           "kind": "no_name_matching_permitted_subtree"}
+        violation = name_constraint_violation(ca, dns_names, uri_names)
+        if violation is not None:
+            return False, violation
     return True, None
 
 
@@ -131,18 +155,67 @@ def check_path_len(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, dict | No
     return True, None
 
 
+def eku_cert_violation(pc: ParsedCert, is_leaf: bool) -> dict | None:
+    """EKU verdict for a single certificate at a fixed role.
+
+    The code-signing profile treats the leaf (must assert codeSigning) and
+    CAs (an absent EKU is unrestricted; a present EKU must contain
+    codeSigning) independently, so the check is path independent and can be
+    cached per certificate.
+    """
+    if is_leaf:
+        if pc.eku is None or OID_EKU_CODE_SIGNING not in pc.eku:
+            return {"rule": "EKU", "at": pc.fingerprint,
+                    "required": OID_EKU_CODE_SIGNING,
+                    "present": sorted(pc.eku or [])}
+    elif pc.eku is not None and OID_EKU_CODE_SIGNING not in pc.eku:
+        return {"rule": "EKU", "at": pc.fingerprint,
+                "present": sorted(pc.eku)}
+    return None
+
+
 def check_eku(path_leaf_to_root: list[ParsedCert]) -> tuple[bool, dict | None]:
     """Code-signing EKU profile: leaf must assert codeSigning; any EKU in a
     CA must also include it (RFC 5280 §4.2.1.12)."""
     leaf = path_leaf_to_root[0]
-    if leaf.eku is None or OID_EKU_CODE_SIGNING not in leaf.eku:
-        return False, {"rule": "EKU", "at": leaf.fingerprint,
-                       "required": OID_EKU_CODE_SIGNING, "present": sorted(leaf.eku or [])}
+    fail = eku_cert_violation(leaf, is_leaf=True)
+    if fail is not None:
+        return False, fail
     for ca in path_leaf_to_root[1:]:
-        if ca.eku is not None and OID_EKU_CODE_SIGNING not in ca.eku:
-            return False, {"rule": "EKU", "at": ca.fingerprint,
-                           "present": sorted(ca.eku)}
+        fail = eku_cert_violation(ca, is_leaf=False)
+        if fail is not None:
+            return False, fail
     return True, None
+
+
+@dataclasses.dataclass(frozen=True)
+class PolicyInput:
+    """Policy-relevant projection of one certificate.
+
+    RFC 5280 §6.1 policy processing depends on exactly these fields, so two
+    DER-distinct certificates with equal projections are interchangeable for
+    policy evaluation; the finder memoizes on the projection sequence to keep
+    cross-signed ladders of equivalent certificates polynomial.
+    """
+
+    fingerprint: str
+    self_issued: bool
+    policy_oids: frozenset[str]
+    policy_mappings: tuple[tuple[str, str], ...]
+    require_explicit_policy: int | None
+    inhibit_policy_mapping: int | None
+    inhibit_any_policy: int | None
+
+    @classmethod
+    def from_cert(cls, pc: ParsedCert) -> "PolicyInput":
+        return cls(
+            fingerprint=pc.fingerprint,
+            self_issued=pc.subject_der == pc.issuer_der,
+            policy_oids=pc.policies.oids,
+            policy_mappings=pc.policy_mappings,
+            require_explicit_policy=pc.require_explicit_policy,
+            inhibit_policy_mapping=pc.inhibit_policy_mapping,
+            inhibit_any_policy=pc.inhibit_any_policy)
 
 
 def process_policies(path_leaf_to_root: list[ParsedCert],
@@ -154,10 +227,23 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
     allowed or inhibited layer by layer. Qualifiers (CPS URIs / user notices)
     are accepted as present but never influence the decision.
     """
-    path = list(reversed(path_leaf_to_root))  # root -> leaf
-    n = len(path)
+    inputs = [PolicyInput.from_cert(pc) for pc in reversed(path_leaf_to_root)]
+    return _process_policy_inputs(inputs, initial_policies)
+
+
+def process_policy_inputs(
+        inputs_leaf_to_root: list[PolicyInput],
+        initial_policies: frozenset[str]) -> tuple[bool, dict | None, list[dict]]:
+    """Policy processing over pre-projected certificates (any order supplied
+    leaf->root). Used by the path finder's equivalence memo."""
+    return _process_policy_inputs(list(reversed(inputs_leaf_to_root)),
+                                  initial_policies)
+
+
+def _process_policy_inputs(
+        path: list[PolicyInput],
+        initial_policies: frozenset[str]) -> tuple[bool, dict | None, list[dict]]:
     ANY = OID_ANY_POLICY
-    LARGE = 10 ** 6
 
     class Node:
         __slots__ = ("policy", "expected", "parent", "lineage")
@@ -171,6 +257,7 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
             # user policy that was mapped deeper in the chain.
             self.lineage = frozenset(lineage)
 
+    n = len(path)
     # Defaults from RFC 5280 §6.1.2 (b)/(e); user supplies no initial
     # constraint values.
     explicit = n
@@ -180,7 +267,7 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
     trace: list[dict] = []
 
     for i, cert in enumerate(path, start=1):
-        self_issued = cert.subject_der == cert.issuer_der
+        self_issued = cert.self_issued
         # RFC 5280 §6.1.3 ordering: the certificate is matched against the
         # *current* counters; non-self-issued certs then consume one level;
         # the certificate's own constraint extensions finally take effect
@@ -193,7 +280,7 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
                            "reason": "policyMapping_inhibited",
                            "mappings": [list(m) for m in mappings]}, trace
 
-        cps = sorted(cert.policies.oids)
+        cps = sorted(cert.policy_oids)
         kids: list[Node] = []
         # (b)/(c) key policy matching.
         for p in cps:

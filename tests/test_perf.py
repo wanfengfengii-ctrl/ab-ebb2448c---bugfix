@@ -134,3 +134,102 @@ def test_cycle_graph_terminates(tmp_path):
         path = result["verdict"]["selected_path"]
         assert path[-1] == fp_of(pf.der(root))
         assert len(path) == 3
+
+
+def _cross_signed_ladder(tmp_path, layers):
+    """One self-signed anchor, ``layers`` CA layers with two DER-distinct but
+    subject/key/superior-identical CA certificates each, and a code-signing
+    leaf whose policy is disjoint from the request policy (all CAs anyPolicy).
+    Returns (store, manifest, raw_request)."""
+    store = Store(str(tmp_path / f"ladder-{layers}"))
+    sid = f"es_ladder_perf_{layers:03d}_0000000000001"
+    store.create_set(sid, "c")
+    p_leaf = "1.2.3.4.5.91"
+    p_req = "1.2.3.4.5.92"
+    rows = []
+
+    def add(obj, ref, kind="certificate"):
+        d = pf.der(obj)
+        store.put_blob(d)
+        rows.append({"client_ref": ref, "kind": kind,
+                     "content_sha256": fp_of(d), "received_at": RECEIVED})
+
+    rk = pf.gen_key()
+    root = pf.build_cert("Ladder Root", None, rk, rk, is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True)
+    add(root, "root")
+    keys = [rk]
+    issuer = root
+    layer_certs = [[root]]
+    for i in range(1, layers + 1):
+        k = pf.gen_key()
+        keys.append(k)
+        variants = []
+        for _ in range(2):  # two DERs, same subject/key/superior
+            c = pf.build_cert(f"Ladder CA {i}", issuer, k, keys[-2], is_ca=True,
+                              key_usage=("keyCertSign", "cRLSign"),
+                              policies=[ANY])
+            variants.append(c)
+            add(c, f"ca{i}-{fp_of(pf.der(c))[:8]}")
+        issuer = variants[0]
+        layer_certs.append(variants)
+    lk = pf.gen_key()
+    leaf = pf.build_cert("codesign.ladder", issuer, lk, keys[-1],
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=[p_leaf],
+                         san_dns=("codesign.ladder",))
+    add(leaf, "leaf")
+    # GOOD CRL proving each non-anchor cert at signed_at.
+    for i in range(1, layers + 1):
+        add(pf.build_crl(layer_certs[i - 1][0], keys[i - 1], [],
+                         last_update=SIGNED - 100, next_update=SIGNED + 100,
+                         crl_number=1), f"crl{i}", kind="crl")
+    add(pf.build_crl(layer_certs[layers][0], keys[layers], [],
+                     last_update=SIGNED - 100, next_update=SIGNED + 100,
+                     crl_number=1), "crl-leaf", kind="crl")
+    store.add_items(sid, rows)
+    manifest = store.seal(sid)
+    import hashlib
+    raw = {
+        "artifact_digest": hashlib.sha256(b"artifact").digest().hex(),
+        "signature": "00" * 70,
+        "signature_algorithm": "1.2.840.10045.4.3.2",
+        "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+        "leaf_certificate_sha256": fp_of(pf.der(leaf)),
+        "initial_policies": [p_req],
+        "trust_anchors": [fp_of(pf.der(root))]}
+    return store, manifest, raw
+
+
+def test_cross_signed_ladder_scales_with_depth(tmp_path):
+    """6 -> 12 CA layers (2 equivalent cross-signs per layer) must not blow up
+    adjudication time; rejection must stay POLICY and cover every complete
+    candidate (2**layers) merged into one equivalent-branch group."""
+    import statistics
+    import time
+    from app.adjudge import normalize_request, run_core
+    from app.loader import LoadedSet
+
+    timings = {}
+    for layers in (6, 12):
+        store, manifest, raw = _cross_signed_ladder(tmp_path, layers)
+        req = normalize_request(raw)
+        samples = []
+        result = None
+        for _ in range(3):  # fresh lazy loader each time (cold parse caches)
+            loaded = LoadedSet.from_store(store, manifest)
+            t0 = time.perf_counter()
+            result = run_core(loaded, manifest, req)
+            samples.append(time.perf_counter() - t0)
+        timings[layers] = statistics.median(samples)
+        assert result["verdict"]["status"] == "REJECTED"
+        assert result["verdict"]["failed_rule"] == "POLICY"
+        groups = result["verdict"]["rejection_proof"]["path_level_failures"]
+        assert sum(g["path_count"] for g in groups) == 2 ** layers
+    # Single-adjudication CPU time from 6 to 12 layers grows at most 8x;
+    # a 6-layer run under 0.02 s counts as 0.02 s.
+    base = max(timings[6], 0.02)
+    assert timings[12] <= 8.0 * base, (timings[6], timings[12])
+    # Generous absolute ceiling keeps the regression honest on slow CI.
+    assert timings[12] < 5.0
