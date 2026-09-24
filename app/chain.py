@@ -153,128 +153,168 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
     inhibitAnyPolicy / requireExplicitPolicy, and policyMappings that are
     allowed or inhibited layer by layer. Qualifiers (CPS URIs / user notices)
     are accepted as present but never influence the decision.
+
+    The per-certificate transition (:func:`policy_step`) and the §6.1.5
+    wrap-up (:func:`policy_wrap_up`) operate on immutable, canonical
+    valid-policy-tree levels, so callers (path search) can memoize them and
+    merge DER-distinct cross-certificates with identical policy content.
     """
     path = list(reversed(path_leaf_to_root))  # root -> leaf
     n = len(path)
-    ANY = OID_ANY_POLICY
-    LARGE = 10 ** 6
-
-    class Node:
-        __slots__ = ("policy", "expected", "parent", "lineage")
-
-        def __init__(self, policy, expected, parent, lineage=frozenset()):
-            self.policy = policy
-            self.expected = set(expected)
-            self.parent = parent
-            # Concrete policy OIDs accumulated root->this node, including
-            # both sides of mappings, so the final intersection can match a
-            # user policy that was mapped deeper in the chain.
-            self.lineage = frozenset(lineage)
-
+    level = (_PolicyTreeNode(OID_ANY_POLICY, (OID_ANY_POLICY,), ()),)
     # Defaults from RFC 5280 §6.1.2 (b)/(e); user supplies no initial
     # constraint values.
-    explicit = n
-    inhibit_any = n
-    inhibit_map = n + 1
-    parents = [Node(ANY, {ANY}, -1)]
+    counters = (n, n, n + 1)  # explicit, inhibitAnyPolicy, inhibitPolicyMapping
     trace: list[dict] = []
 
     for i, cert in enumerate(path, start=1):
-        self_issued = cert.subject_der == cert.issuer_der
-        # RFC 5280 §6.1.3 ordering: the certificate is matched against the
-        # *current* counters; non-self-issued certs then consume one level;
-        # the certificate's own constraint extensions finally take effect
-        # for certificates below it. This reproduces the PKITS semantics
-        # (e.g. inhibitAnyPolicy SkipCerts=1 admits anyPolicy in the first
-        # CA but suppresses it in the next).
-        mappings = list(cert.policy_mappings)
-        if inhibit_map == 0 and mappings:
+        failure, result = policy_step(cert, i, counters, level)
+        if failure is not None:
             return False, {"rule": "POLICY", "at": cert.fingerprint,
-                           "reason": "policyMapping_inhibited",
-                           "mappings": [list(m) for m in mappings]}, trace
-
-        cps = sorted(cert.policies.oids)
-        kids: list[Node] = []
-        # (b)/(c) key policy matching.
-        for p in cps:
-            for pi, node in enumerate(parents):
-                if p == ANY:
-                    if node.policy == ANY and (i == 1 or self_issued
-                                              or inhibit_any > 0):
-                        kids.append(Node(ANY, node.expected, pi, node.lineage))
-                    else:
-                        # anyPolicy suppressed: expand only concrete expected
-                        # policies, never re-introduce ANY.
-                        for o in sorted(node.expected):
-                            if o == ANY:
-                                continue
-                            kids.append(Node(o, {o}, pi,
-                                             node.lineage | {o}))
-                elif node.policy == ANY or p in node.expected:
-                    kids.append(Node(p, {p}, pi, node.lineage | {p}))
-        # (d) policy mappings.
-        if mappings:
-            for idp, sdp in mappings:
-                for node in parents:
-                    if idp in node.expected:
-                        node.expected.add(sdp)
-                        node.expected.discard(idp)
-            for idp, sdp in mappings:
-                for pi, node in enumerate(parents):
-                    if node.policy == ANY and sdp in node.expected:
-                        kids.append(Node(sdp, {sdp}, pi,
-                                         node.lineage | {idp, sdp}))
-                for k in kids:
-                    if k.policy == idp:
-                        k.policy = sdp
-                        k.expected = {sdp}
-                        k.lineage = k.lineage | {idp, sdp}
-            seen = set()
-            deduped = []
-            for k in kids:
-                key = (k.parent, k.policy, tuple(sorted(k.expected)),
-                       tuple(sorted(k.lineage)))
-                if key not in seen:
-                    seen.add(key)
-                    deduped.append(k)
-            kids = deduped
-        # anyPolicy suppression at this depth.
-        if inhibit_any == 0 and i > 1 and not self_issued:
-            kids = [k for k in kids if k.policy != ANY]
-        if not kids:
-            return False, {"rule": "POLICY", "at": cert.fingerprint,
-                           "reason": "valid_policy_tree_empty",
-                           "certificate_policies": cps}, trace
-
-        # Consume one level, then adopt this certificate's constraints.
-        if not self_issued:
-            explicit = max(explicit - 1, 0)
-            inhibit_any = max(inhibit_any - 1, 0)
-            inhibit_map = max(inhibit_map - 1, 0)
-        if cert.require_explicit_policy is not None:
-            explicit = min(explicit, cert.require_explicit_policy)
-        if cert.inhibit_policy_mapping is not None:
-            inhibit_map = min(inhibit_map, cert.inhibit_policy_mapping)
-        if cert.inhibit_any_policy is not None:
-            inhibit_any = min(inhibit_any, cert.inhibit_any_policy)
-
+                           **failure}, trace
+        level, counters = result
         trace.append({
             "certificate": cert.fingerprint,
             "depth": i,
-            "certificate_policies": cps,
-            "valid_policies": sorted({k.policy for k in kids}),
-            "explicit_policy_remaining": explicit,
-            "inhibit_any_policy_remaining": inhibit_any,
-            "inhibit_policy_mapping_remaining": inhibit_map,
-            "applied_mappings": [list(m) for m in mappings],
+            "certificate_policies": sorted(cert.policies.oids),
+            "valid_policies": sorted({k.policy for k in level}),
+            "explicit_policy_remaining": counters[0],
+            "inhibit_any_policy_remaining": counters[1],
+            "inhibit_policy_mapping_remaining": counters[2],
+            "applied_mappings": [list(m) for m in cert.policy_mappings],
         })
-        parents = kids
 
-    # §6.1.5 wrap-up policy intersection. Union every leaf lineage (this is
-    # what concrete policies, including mapped ones, the chain can assert).
+    ok, detail = policy_wrap_up(level, counters[0], frozenset(initial_policies))
+    if not ok:
+        return False, {"rule": "POLICY", "at": path[-1].fingerprint, **detail}, trace
+    return True, detail, trace
+
+
+class _PolicyTreeNode:
+    """Canonical node of the valid policy tree.
+
+    Two nodes with equal ``(policy, expected, lineage)`` are merged even when
+    they have different tree parents: only these three fields influence any
+    later matching decision, so the merge preserves the verdict. ``expected``
+    is the set of policy OIDs that may still match below the node;
+    ``lineage`` accumulates every concrete OID seen or mapped on the
+    root→node chain so the final intersection can match mapped policies.
+    """
+
+    __slots__ = ("policy", "expected", "lineage")
+
+    def __init__(self, policy: str, expected, lineage=frozenset()):
+        self.policy = policy
+        self.expected = frozenset(expected)
+        self.lineage = frozenset(lineage)
+
+    def __eq__(self, other):
+        return (self.policy == other.policy
+                and self.expected == other.expected
+                and self.lineage == other.lineage)
+
+    def __hash__(self):
+        return hash((self.policy, self.expected, self.lineage))
+
+    def __lt__(self, other):
+        return (self.policy, tuple(sorted(self.expected)),
+                tuple(sorted(self.lineage))) < (
+            other.policy, tuple(sorted(other.expected)),
+            tuple(sorted(other.lineage)))
+
+
+def policy_step(cert: ParsedCert, i: int, counters: tuple[int, int, int],
+                level: tuple[_PolicyTreeNode, ...]
+                ) -> tuple[dict | None, tuple | None]:
+    """Process certificate ``i`` (trust anchor = 1) of a root→leaf path.
+
+    ``counters`` is ``(explicit, inhibit_any, inhibit_map)`` before this
+    certificate; on success returns ``(None, (new_level, new_counters))``.
+    """
+    ANY = OID_ANY_POLICY
+    explicit, inhibit_any, inhibit_map = counters
+    self_issued = cert.subject_der == cert.issuer_der
+    mappings = list(cert.policy_mappings)
+
+    # RFC 5280 §6.1.3 ordering: the certificate is matched against the
+    # *current* counters; non-self-issued certs then consume one level;
+    # the certificate's own constraint extensions finally take effect
+    # for certificates below it. This reproduces the PKITS semantics
+    # (e.g. inhibitAnyPolicy SkipCerts=1 admits anyPolicy in the first
+    # CA but suppresses it in the next).
+    if inhibit_map == 0 and mappings:
+        return {"reason": "policyMapping_inhibited",
+                "mappings": [list(m) for m in mappings]}, None
+
+    cps = sorted(cert.policies.oids)
+    kids: list[_PolicyTreeNode] = []
+    # (b)/(c) key policy matching.
+    for p in cps:
+        for node in level:
+            if p == ANY:
+                if node.policy == ANY and (i == 1 or self_issued
+                                           or inhibit_any > 0):
+                    kids.append(_PolicyTreeNode(ANY, node.expected,
+                                                node.lineage))
+                else:
+                    # anyPolicy suppressed: expand only concrete expected
+                    # policies, never re-introduce ANY.
+                    for o in sorted(node.expected):
+                        if o == ANY:
+                            continue
+                        kids.append(_PolicyTreeNode(o, (o,),
+                                                    node.lineage | {o}))
+            elif node.policy == ANY or p in node.expected:
+                kids.append(_PolicyTreeNode(p, (p,), node.lineage | {p}))
+
+    # (d) policy mappings.
+    if mappings:
+        expected_sets = [set(n.expected) for n in level]
+        for idp, sdp in mappings:
+            for e in expected_sets:
+                if idp in e:
+                    e.add(sdp)
+                    e.discard(idp)
+        for idp, sdp in mappings:
+            for pi, node in enumerate(level):
+                if node.policy == ANY and sdp in expected_sets[pi]:
+                    kids.append(_PolicyTreeNode(sdp, (sdp,),
+                                                node.lineage | {idp, sdp}))
+            for ki, k in enumerate(kids):
+                if k.policy == idp:
+                    kids[ki] = _PolicyTreeNode(sdp, (sdp,),
+                                               k.lineage | {idp, sdp})
+
+    # anyPolicy suppression at this depth.
+    if inhibit_any == 0 and i > 1 and not self_issued:
+        kids = [k for k in kids if k.policy != ANY]
+    if not kids:
+        return {"reason": "valid_policy_tree_empty",
+                "certificate_policies": cps}, None
+
+    # Consume one level, then adopt this certificate's constraints.
+    if not self_issued:
+        explicit = max(explicit - 1, 0)
+        inhibit_any = max(inhibit_any - 1, 0)
+        inhibit_map = max(inhibit_map - 1, 0)
+    if cert.require_explicit_policy is not None:
+        explicit = min(explicit, cert.require_explicit_policy)
+    if cert.inhibit_policy_mapping is not None:
+        inhibit_map = min(inhibit_map, cert.inhibit_policy_mapping)
+    if cert.inhibit_any_policy is not None:
+        inhibit_any = min(inhibit_any, cert.inhibit_any_policy)
+
+    return None, (tuple(sorted(set(kids))),
+                  (explicit, inhibit_any, inhibit_map))
+
+
+def policy_wrap_up(level: tuple[_PolicyTreeNode, ...], explicit: int,
+                   initial_policies: frozenset[str]) -> tuple[bool, dict]:
+    """§6.1.5 wrap-up policy intersection over the final tree level."""
+    ANY = OID_ANY_POLICY
     authority_concrete: set[str] = set()
     has_any_leaf = False
-    for k in parents:
+    for k in level:
         if k.policy == ANY:
             has_any_leaf = True
         else:
@@ -291,12 +331,11 @@ def process_policies(path_leaf_to_root: list[ParsedCert],
         if has_any_leaf and explicit > 0:
             result |= user
     if not result:
-        return False, {"rule": "POLICY", "at": path[-1].fingerprint,
-                       "reason": "no_acceptable_policy",
+        return False, {"reason": "no_acceptable_policy",
                        "authority_policies": sorted(
-                           {k.policy for k in parents}),
-                       "initial_policies": sorted(user)}, trace
-    return True, {"user_constrained_policy_set": sorted(result)}, trace
+                           {k.policy for k in level}),
+                       "initial_policies": sorted(user)}
+    return True, {"user_constrained_policy_set": sorted(result)}
 
 
 def validate_static_chain(path_leaf_to_root: list[ParsedCert],

@@ -134,3 +134,79 @@ def test_cycle_graph_terminates(tmp_path):
         path = result["verdict"]["selected_path"]
         assert path[-1] == fp_of(pf.der(root))
         assert len(path) == 3
+
+
+def _cross_signed_ladder(tmp_path, layers):
+    """One anchor, ``layers`` CA tiers each with two DER-distinct CAs (same
+    subject name, public key and issuer), GOOD revocation everywhere, and a
+    code-signing leaf whose policy is disjoint from the requested one."""
+    store = Store(str(tmp_path / f"data-{layers}"))
+    sid = f"es_ladder_{layers:040d}"
+    store.create_set(sid, "c")
+    keys = [pf.gen_key() for _ in range(layers + 1)]
+    root = pf.build_cert("CA0", None, keys[0], keys[0], is_ca=True,
+                         key_usage=("keyCertSign", "cRLSign"), policies=[ANY],
+                         self_signed=True)
+    tiers = [[root]]
+    for j in range(1, layers + 1):
+        tmpl = tiers[j - 1][0]
+        tiers.append([
+            pf.build_cert(f"CA{j}", tmpl, keys[j], keys[j - 1], is_ca=True,
+                          key_usage=("keyCertSign", "cRLSign"), policies=[ANY])
+            for _ in range(2)])
+    lk = pf.gen_key()
+    leaf = pf.build_cert("codesign.leaf", tiers[layers][0], lk, keys[layers],
+                         key_usage=("digitalSignature",),
+                         eku=("codeSigning",), policies=["1.2.3.4.5.1"],
+                         san_dns=("codesign.leaf",))
+    rows = []
+    for c in [root] + [c for tier in tiers[1:] for c in tier] + [leaf]:
+        d = pf.der(c)
+        store.put_blob(d)
+        rows.append({"client_ref": "c" + fp_of(d)[:12], "kind": "certificate",
+                     "content_sha256": fp_of(d), "received_at": RECEIVED})
+    for j in range(layers + 1):
+        crl = pf.build_crl(tiers[j][0], keys[j], [],
+                           last_update=SIGNED - 100, next_update=SIGNED + 100,
+                           crl_number=1)
+        d = pf.der(crl)
+        store.put_blob(d)
+        rows.append({"client_ref": f"r{j}", "kind": "crl",
+                     "content_sha256": fp_of(d), "received_at": RECEIVED})
+    store.add_items(sid, rows)
+    store.seal(sid)
+    d = hashlib.sha256(b"artifact").digest()
+    s = lk.sign(d, ec.ECDSA(Prehashed(hashes.SHA256())))
+    request = {
+        "artifact_digest": d.hex(), "signature": s.hex(),
+        "signature_algorithm": "1.2.840.10045.4.3.2",
+        "signed_at": SIGNED, "knowledge_cutoff": CUTOFF,
+        "leaf_certificate_sha256": fp_of(pf.der(leaf)),
+        "initial_policies": ["1.2.3.4.5.2"],
+        "trust_anchors": [fp_of(pf.der(root))]}
+    return store, sid, request
+
+
+def test_cross_signed_ladder_not_exponential(tmp_path):
+    """6->12 cross-signed layers may grow adjudication CPU by at most 8x,
+    every branch must still be reported as a POLICY rejection with full
+    concrete-path coverage (2^(L-1) paths), and results stay deterministic."""
+    timings = {}
+    results = {}
+    for layers in (6, 12):
+        store, sid, request = _cross_signed_ladder(tmp_path, layers)
+        t0 = time.perf_counter()
+        results[layers] = adjudicate(store, sid, request)
+        timings[layers] = max(0.02, time.perf_counter() - t0)
+
+    for layers, result in results.items():
+        verdict = result["verdict"]
+        assert verdict["status"] == "REJECTED"
+        assert verdict["failed_rule"] == "POLICY"
+        groups = verdict["rejection_proof"]["path_level_failures"]
+        # Two variants at each of the L CA tiers => 2^L concrete anchor paths.
+        covered = sum(g["path_count"] for g in groups)
+        assert covered == 2 ** layers
+        assert all(g["rule"] == "POLICY" for g in groups)
+
+    assert timings[12] <= 8.0 * timings[6]
